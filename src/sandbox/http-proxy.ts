@@ -26,7 +26,9 @@ import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
   connectViaParentProxy,
   dialDirect,
+  applyOutboundBodyFraming,
   openConnectTunnel,
+  prepareOutboundBodyFraming,
   proxyAuthHeader,
   selectParentProxyUrl,
   shouldBypassParentProxy,
@@ -425,6 +427,13 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         body = out
       }
 
+      // A body without an outbound Content-Length must leave chunk-framed —
+      // stripHopByHop dropped Transfer-Encoding and Node does not re-frame
+      // bodies on GET/HEAD/OPTIONS/DELETE by itself. Decide (and neutralize
+      // any framing-defeating Expect header) after ALL header mutation, so
+      // a hook cannot reopen the hole; apply right after construction.
+      const needsChunkedFraming = prepareOutboundBodyFraming(req, fwdHeaders)
+
       let proxyReq
       if (mitmSocketPath) {
         logForDebugging(
@@ -484,6 +493,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           },
         )
       }
+
+      applyOutboundBodyFraming(proxyReq, needsChunkedFraming)
 
       proxyReq.on('error', err => {
         logForDebugging(`Proxy request failed: ${err.message}`, {

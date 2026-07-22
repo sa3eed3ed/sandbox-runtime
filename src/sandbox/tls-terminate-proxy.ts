@@ -23,6 +23,8 @@ import { logForDebugging } from '../utils/debug.js'
 import type { MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
+  drainThenDestroy,
+  requestDeclaresBody,
   respondDenied,
   type FilterRequestCallback,
   type MutateForwardedHeaders,
@@ -32,7 +34,11 @@ import {
   type GetBodySubstitutions,
 } from './body-substitution.js'
 import { mintLeafCert, secureContextFor } from './mitm-leaf.js'
-import { stripHopByHop } from './parent-proxy.js'
+import {
+  applyOutboundBodyFraming,
+  prepareOutboundBodyFraming,
+  stripHopByHop,
+} from './parent-proxy.js'
 import { sha256Hex } from './aws-sigv4.js'
 import type { PlanSigv4 } from './credential-aws-pairs.js'
 
@@ -316,6 +322,13 @@ async function forwardUpstream(
   // correct verification under both Node and Bun.
   const fwdHeaders = stripHopByHop(req.headers)
   delete fwdHeaders.host
+  // The framing decision (and its Expect-delete) must run BEFORE SigV4
+  // planning: the planner's signed-header presence check has to see the
+  // final header set. Deleting a signed Expect after the plan would let
+  // the request through and then forward it without a SignedHeaders
+  // member — an upstream signature mismatch instead of the clean
+  // plan-time deny ('signed header "expect" is missing').
+  let needsChunkedFraming = prepareOutboundBodyFraming(req, fwdHeaders)
   // SigV4 planning runs on the PRE-substitution headers (the trigger is
   // the fake access key id in the credential scope, which the header
   // substitution below replaces) but on the POST-strip view: the plan's
@@ -378,9 +391,16 @@ async function forwardUpstream(
               `buffering, or use an unmasked credential to have the ` +
               `request forwarded untouched.`,
           )
-          // Drain (discarding) whatever the client is still sending so it
-          // can read the 403 instead of seeing a reset mid-upload.
-          bodySource.resume()
+          // Drain (discarding, bounded) whatever the client is still
+          // sending so it can read the 403 instead of seeing a reset
+          // mid-upload, then tear the connection down — same discipline as
+          // the filterRequest deny path; an unbounded resume() would let a
+          // hostile chunked upload pin the socket discarding bytes. The
+          // caps are wider here (8 MiB / 10 s) because an over-cap
+          // rejection legitimately has a large body in flight; a remainder
+          // beyond them may still see a reset after the 403 flushes — the
+          // 403 above names the UNSIGNED-PAYLOAD remediation.
+          drainThenDestroy(bodySource, req, 8 * 1024 * 1024, 10_000)
           return
         }
         logForDebugging(
@@ -391,11 +411,17 @@ async function forwardUpstream(
         return
       }
       payloadHash = sha256Hex(bufferedBody)
-      // Substitution may have re-framed the request (Content-Length is
-      // deleted when a sentinel is not length-matched); the body is now
-      // fully buffered so its exact length is known — restore the header
-      // so the upstream leg and any signed content-length stay consistent.
-      if (bodyTransform) {
+      // The body is fully buffered, so its exact length is known — set
+      // Content-Length when the request carried a body at all. This
+      // restores the header when substitution re-framed the request
+      // (Content-Length is deleted when a sentinel is not length-matched)
+      // and gives a chunked inbound identity framing upstream (some AWS
+      // endpoints reject chunked uploads without a Content-Length). A
+      // bodyless re-sign keeps its original shape — no proxy-injected
+      // `Content-Length: 0` for strict upstreams to trip on.
+      // (A bodyTransform implies a declared body — prepareBodySubstitution
+      // gates on the same predicate.)
+      if (requestDeclaresBody(req)) {
         fwdHeaders['content-length'] = String(bufferedBody.length)
       }
     }
@@ -416,6 +442,17 @@ async function forwardUpstream(
       )
       return
     }
+  }
+
+  // Re-evaluate the framing decision now that all header mutation is done:
+  // body-substitution may have deleted Content-Length, and a mutateHeaders
+  // hook may have re-added Expect, after the early (pre-plan) decision.
+  // Skipped when a signature was just applied — the buffered resign path
+  // restored Content-Length above (so nothing changed), and this call must
+  // never delete a header the signature covers.
+  if (sigv4Plan?.action !== 'resign') {
+    needsChunkedFraming =
+      prepareOutboundBodyFraming(req, fwdHeaders) || needsChunkedFraming
   }
 
   // TODO(terminating-tls): honour parentProxy for the upstream leg.
@@ -445,6 +482,8 @@ async function forwardUpstream(
       upRes.pipe(res)
     },
   )
+
+  applyOutboundBodyFraming(upstream, needsChunkedFraming)
 
   upstream.on('error', err => {
     logForDebugging(
